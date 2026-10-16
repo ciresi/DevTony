@@ -1,0 +1,15 @@
+{
+  "_comment": "mode: advisory = post findings, never block. blocking = a 'fail' verdict fails the CI check. needs_human never fails the check by itself; it adds the label 'ai-gate:needs-human' so a person looks. Pin the model and rerun your test set before changing it.",
+  "model": "claude-sonnet-5-5",
+  "max_tokens": 4000,
+  "max_input_chars": 150000,
+  "gates": {
+    "requirements": { "prompt": "01-requirements.md", "mode": "advisory" },
+    "design": { "prompt": "02-design.md", "mode": "advisory" },
+    "code_review": { "prompt": "04-code-review.md", "mode": "advisory" },
+    "test": { "prompt": "05-test.md", "mode": "advisory" },
+    "security": { "prompt": "06-security.md", "mode": "advisory" },
+    "release": { "prompt": "07-release.md", "mode": "advisory" },
+    "post_deploy": { "prompt": "08-post-deploy.md", "mode": "advisory" }
+  }
+}

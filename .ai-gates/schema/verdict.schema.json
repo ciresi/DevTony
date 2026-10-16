@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AI gate verdict",
+  "type": "object",
+  "required": ["gate", "verdict", "confidence", "findings", "summary"],
+  "additionalProperties": false,
+  "properties": {
+    "gate": {
+      "type": "string",
+      "enum": [
+        "requirements",
+        "design",
+        "build",
+        "code_review",
+        "test",
+        "security",
+        "release",
+        "post_deploy"
+      ]
+    },
+    "verdict": { "type": "string", "enum": ["pass", "fail", "needs_human"] },
+    "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["criterion", "severity", "result", "evidence", "fix"],
+        "additionalProperties": false,
+        "properties": {
+          "criterion": { "type": "string" },
+          "severity": { "type": "string", "enum": ["blocking", "advisory"] },
+          "result": { "type": "string", "enum": ["pass", "fail"] },
+          "evidence": { "type": "string" },
+          "fix": { "type": "string" }
+        }
+      }
+    },
+    "summary": { "type": "string" }
+  }
+}
