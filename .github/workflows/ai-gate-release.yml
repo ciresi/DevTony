@@ -1,0 +1,74 @@
+# Gate 7: Release readiness
+# Run manually before a production deploy. It gathers every gate verdict from
+# PRs merged since the last release tag and drafts the go/no-go packet as an issue.
+name: "AI Gate 7 - Release readiness"
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: "Last release tag (or ISO date) to compare from, e.g. v1.4.0"
+        required: true
+      release_name:
+        description: "Name for this release, e.g. v1.5.0"
+        required: true
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+jobs:
+  release:
+    name: Gate 7 - Release packet
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      BASE_REF: ${{ inputs.base_ref }}
+      RELEASE_NAME: ${{ inputs.release_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect gate verdicts from merged PRs
+        run: python3 .ai-gates/scripts/gh.py collect-verdicts "$BASE_REF" gate_verdicts.json release_scope.md
+
+      - name: Build manifest of changed metadata
+        run: |
+          {
+            echo "Changed metadata since $BASE_REF (git name-status):"
+            git diff --name-status "$BASE_REF"..HEAD -- force-app manifest || true
+            echo
+            for f in $(git ls-files '*destructiveChanges*.xml'); do
+              echo "### $f"; cat "$f"; echo
+            done
+          } > manifest.txt
+
+      - name: Run gate
+        id: gate
+        run: >
+          python3 .ai-gates/scripts/run_gate.py --gate release
+          --input gate_verdicts=gate_verdicts.json --input release_scope=release_scope.md
+          --input manifest=manifest.txt --out-dir gate-out
+
+      - name: Publish packet
+        if: always() && hashFiles('gate-out/release.comment.md') != ''
+        run: |
+          cat gate-out/release.comment.md >> "$GITHUB_STEP_SUMMARY"
+          gh issue create --title "Release readiness: $RELEASE_NAME" \
+            --body-file gate-out/release.comment.md \
+            $([ "${{ steps.gate.outputs.verdict }}" = "needs_human" ] && echo "--label ai-gate:needs-human")
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-packet
+          path: |
+            gate_verdicts.json
+            release_scope.md
+            manifest.txt
+            gate-out/

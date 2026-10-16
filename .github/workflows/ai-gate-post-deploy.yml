@@ -1,0 +1,110 @@
+# Gate 8: Post-deploy monitoring
+# Run after a production deploy (manually, or call it from your deploy workflow
+# with `uses: ./.github/workflows/ai-gate-post-deploy.yml`). It compares org
+# signals in a window before the deploy to the same-length window after it.
+#
+# The default signals are deliberately simple (failed async Apex jobs and org
+# limits). Replace collect_signals with the queries that matter for your org,
+# for example a custom error-log object or Event Monitoring data if licensed.
+name: "AI Gate 8 - Post-deploy"
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_time:
+        description: "Deploy time in UTC, e.g. 2026-10-16T14:00:00Z"
+        required: true
+      window_hours:
+        description: "Hours to compare before and after"
+        required: false
+        default: "2"
+      release_name:
+        description: "Release name, e.g. v1.5.0"
+        required: true
+  workflow_call:
+    inputs:
+      deploy_time: { type: string, required: true }
+      window_hours: { type: string, required: false, default: "2" }
+      release_name: { type: string, required: true }
+    secrets:
+      ANTHROPIC_API_KEY: { required: true }
+      SFDX_AUTH_URL_PROD: { required: true }
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  monitor:
+    name: Gate 8 - Post-deploy check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      DEPLOY_TIME: ${{ inputs.deploy_time }}
+      WINDOW_HOURS: ${{ inputs.window_hours }}
+      RELEASE_NAME: ${{ inputs.release_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wait until the after-window has passed
+        run: |
+          end=$(date -u -d "$DEPLOY_TIME + $WINDOW_HOURS hours" +%s)
+          now=$(date -u +%s)
+          wait=$(( end - now ))
+          if [ "$wait" -gt 0 ]; then
+            if [ "$wait" -gt 18000 ]; then echo "Window ends more than 5h from now; run this later."; exit 1; fi
+            echo "Waiting $wait seconds for the after-window to finish"; sleep "$wait"
+          fi
+
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - name: Install Salesforce CLI and log in to production (read-only use)
+        env:
+          SFDX_AUTH_URL: ${{ secrets.SFDX_AUTH_URL_PROD }}
+        run: |
+          npm install --global @salesforce/cli
+          printf '%s' "$SFDX_AUTH_URL" > prod.txt
+          sf org login sfdx-url --sfdx-url-file prod.txt --alias prod
+          rm prod.txt
+
+      - name: Collect signals
+        run: |
+          before_start=$(date -u -d "$DEPLOY_TIME - $WINDOW_HOURS hours" +%Y-%m-%dT%H:%M:%SZ)
+          after_end=$(date -u -d "$DEPLOY_TIME + $WINDOW_HOURS hours" +%Y-%m-%dT%H:%M:%SZ)
+          collect_signals() {  # $1 = start, $2 = end
+            echo "Window: $1 to $2"
+            echo
+            echo "Failed async Apex jobs by class and error:"
+            sf data query --target-org prod --result-format csv --query \
+              "SELECT ApexClass.Name, ExtendedStatus, COUNT(Id) n FROM AsyncApexJob WHERE Status = 'Failed' AND CreatedDate >= $1 AND CreatedDate < $2 GROUP BY ApexClass.Name, ExtendedStatus" || echo "(query failed)"
+            echo
+            echo "Async Apex jobs by status:"
+            sf data query --target-org prod --result-format csv --query \
+              "SELECT Status, COUNT(Id) n FROM AsyncApexJob WHERE CreatedDate >= $1 AND CreatedDate < $2 GROUP BY Status" || echo "(query failed)"
+            # Add your own: e.g. a custom Error_Log__c object, Cases created, Opportunities updated.
+          }
+          collect_signals "$before_start" "$DEPLOY_TIME" > baseline.txt
+          { collect_signals "$DEPLOY_TIME" "$after_end"
+            echo; echo "Org limits now (Max / Remaining):"
+            sf org list limits --target-org prod || echo "(limits unavailable)"
+          } > current.txt
+          echo "$DEPLOY_TIME" > deploy_time.txt
+          echo "Release $RELEASE_NAME. See the release-readiness issue for scope." > scope.txt
+
+      - name: Run gate
+        id: gate
+        run: >
+          python3 .ai-gates/scripts/run_gate.py --gate post_deploy
+          --input deploy_time=deploy_time.txt --input baseline=baseline.txt
+          --input current=current.txt --input release_scope=scope.txt --out-dir gate-out
+
+      - name: Publish result
+        if: always() && hashFiles('gate-out/post_deploy.comment.md') != ''
+        run: |
+          cat gate-out/post_deploy.comment.md >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.gate.outputs.verdict }}" != "pass" ]; then
+            gh issue create --title "Post-deploy check needs attention: $RELEASE_NAME" \
+              --body-file gate-out/post_deploy.comment.md --label ai-gate:needs-human
+          fi

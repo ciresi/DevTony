@@ -1,0 +1,38 @@
+# Gate 1: Requirements
+# Runs when a story issue gets the "ready-for-dev" label, or is edited while it has it.
+name: "AI Gate 1 - Requirements"
+
+on:
+  issues:
+    types: [labeled, edited]
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: ai-gate-requirements-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  requirements:
+    if: contains(github.event.issue.labels.*.name, 'ready-for-dev')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      ISSUE: ${{ github.event.issue.number }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch story
+        run: python3 .ai-gates/scripts/gh.py issue "$ISSUE" story.md
+
+      - name: Run gate
+        id: gate
+        run: python3 .ai-gates/scripts/run_gate.py --gate requirements --input story=story.md --out-dir gate-out
+
+      - name: Post result to the issue
+        if: always() && hashFiles('gate-out/requirements.comment.md') != ''
+        run: python3 .ai-gates/scripts/gh.py comment "$ISSUE" gate-out/requirements.comment.md "${{ steps.gate.outputs.verdict }}"

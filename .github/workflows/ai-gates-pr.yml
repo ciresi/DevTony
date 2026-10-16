@@ -1,0 +1,242 @@
+# Gates 2-6 on every pull request:
+#   2 Design (only when the PR adds or changes a file under docs/design/)
+#   3 Build  (scratch org deploy + Apex tests + coverage + test-tampering check; no AI)
+#   4 Code review
+#   5 Test results analysis
+#   6 Security (Salesforce Code Analyzer + AI triage)
+#
+# Make these required status checks in branch protection once you trust them:
+#   "Gate 3 - Build" right away (it is deterministic), the AI gates later.
+name: "AI Gates 2-6 - Pull request"
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: ai-gates-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  PR: ${{ github.event.pull_request.number }}
+  BASE_SHA: ${{ github.event.pull_request.base.sha }}
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+  MIN_COVERAGE: "75" # Salesforce's production minimum is 75% org-wide; many teams set higher. Verify for your org.
+  SOURCE_DIR: force-app
+
+jobs:
+  context:
+    name: Gather PR context
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      has_design: ${{ steps.ctx.outputs.has_design }}
+      has_code: ${{ steps.ctx.outputs.has_code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: ctx
+        name: Build story, diff and design inputs
+        run: |
+          mkdir -p ctx
+          python3 .ai-gates/scripts/gh.py story-for-pr "$PR" ctx/story.md
+          git diff "$BASE_SHA"...HEAD -- . ':(exclude)*.xml' > ctx/pr.diff
+          git diff --name-only "$BASE_SHA"...HEAD > ctx/changed_files.txt
+          : > ctx/design.md
+          for f in $(grep '^docs/design/' ctx/changed_files.txt | grep -v 'TEMPLATE.md$' || true); do
+            [ -f "$f" ] && { echo "## $f"; cat "$f"; echo; } >> ctx/design.md
+          done
+          echo "has_design=$([ -s ctx/design.md ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "has_code=$(grep -qE '^'"$SOURCE_DIR"'/' ctx/changed_files.txt && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pr-context
+          path: ctx/
+
+  design:
+    name: Gate 2 - Design
+    needs: context
+    if: needs.context.outputs.has_design == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: pr-context, path: ctx }
+      - id: gate
+        run: >
+          python3 .ai-gates/scripts/run_gate.py --gate design
+          --input story=ctx/story.md --input design=ctx/design.md
+          --input standards=.ai-gates/standards/architecture-standards.md --out-dir gate-out
+      - if: always() && hashFiles('gate-out/design.comment.md') != ''
+        run: python3 .ai-gates/scripts/gh.py comment "$PR" gate-out/design.comment.md "${{ steps.gate.outputs.verdict }}"
+
+  code_review:
+    name: Gate 4 - Code review
+    needs: context
+    if: needs.context.outputs.has_code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: pr-context, path: ctx }
+      - id: gate
+        run: >
+          python3 .ai-gates/scripts/run_gate.py --gate code_review
+          --input story=ctx/story.md --input design=ctx/design.md
+          --input standards=.ai-gates/standards/architecture-standards.md
+          --input diff=ctx/pr.diff --out-dir gate-out
+      - if: always() && hashFiles('gate-out/code_review.comment.md') != ''
+        run: python3 .ai-gates/scripts/gh.py comment "$PR" gate-out/code_review.comment.md "${{ steps.gate.outputs.verdict }}"
+
+  build:
+    name: Gate 3 - Build
+    needs: context
+    if: needs.context.outputs.has_code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with: { name: pr-context, path: ctx }
+
+      - name: B4/B5 - Test tampering and AC mapping
+        id: tamper
+        continue-on-error: ${{ contains(github.event.pull_request.labels.*.name, 'ai-gate:allow-test-removal') }}
+        run: python3 .ai-gates/scripts/check_test_tampering.py "$BASE_SHA" ctx/story.md gate-out-build.md
+
+      - name: Post build check comment
+        if: always() && hashFiles('gate-out-build.md') != ''
+        run: python3 .ai-gates/scripts/gh.py comment "$PR" gate-out-build.md
+
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+
+      # This repo's own package.json scripts. They run before the scratch org
+      # so formatting or LWC failures show up in a minute, not after a deploy.
+      - name: Install project dev dependencies
+        run: npm install --no-audit --no-fund
+      - name: B6 - ESLint and LWC Jest
+        run: |
+          npm run lint --if-present -- --no-error-on-unmatched-pattern
+          npx sfdx-lwc-jest -- --passWithNoTests
+      # Report-only: some template files (package.json, eslint.config.js,
+      # jest.config.js, manifest/package.xml) don't pass Prettier yet.
+      # Run `npm run prettier` once, then delete continue-on-error.
+      - name: B7 - Prettier formatting (report only)
+        continue-on-error: true
+        run: npm run prettier:verify
+
+      - name: Install Salesforce CLI
+        run: npm install --global @salesforce/cli && sf version
+
+      - name: Authenticate Dev Hub
+        env:
+          SFDX_AUTH_URL: ${{ secrets.SFDX_AUTH_URL_DEVHUB }}
+        run: |
+          printf '%s' "$SFDX_AUTH_URL" > devhub.txt
+          sf org login sfdx-url --sfdx-url-file devhub.txt --set-default-dev-hub --alias devhub
+          rm devhub.txt
+
+      - name: Create scratch org
+        run: >
+          sf org create scratch --definition-file config/project-scratch-def.json
+          --alias ci --set-default --duration-days 1 --wait 20
+
+      - name: B1 - Deploy source
+        run: sf project deploy start --target-org ci --wait 30
+
+      - name: B2/B3 - Run Apex tests with coverage
+        run: |
+          mkdir -p test-results
+          sf apex run test --target-org ci --test-level RunLocalTests --code-coverage \
+            --wait 60 --json > test-results/run.json || true
+          python3 .ai-gates/scripts/summarize_tests.py test-results/run.json "$MIN_COVERAGE" \
+            test-results/summary.txt test-results/coverage.txt
+
+      - name: Delete scratch org
+        if: always()
+        run: sf org delete scratch --target-org ci --no-prompt || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: test-results/
+
+  test:
+    name: Gate 5 - Test analysis
+    needs: [context, build]
+    if: always() && needs.context.outputs.has_code == 'true' && needs.build.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: pr-context, path: ctx }
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with: { name: test-results, path: test-results }
+      - id: gate
+        run: >
+          python3 .ai-gates/scripts/run_gate.py --gate test
+          --input story=ctx/story.md --input test_results=test-results/summary.txt
+          --input coverage=test-results/coverage.txt --input changed_files=ctx/changed_files.txt
+          --out-dir gate-out
+      - if: always() && hashFiles('gate-out/test.comment.md') != ''
+        run: python3 .ai-gates/scripts/gh.py comment "$PR" gate-out/test.comment.md "${{ steps.gate.outputs.verdict }}"
+
+  security:
+    name: Gate 6 - Security
+    needs: context
+    if: needs.context.outputs.has_code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: pr-context, path: ctx }
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - uses: actions/setup-java@v4 # some Code Analyzer engines (PMD) need Java
+        with: { distribution: temurin, java-version: "17" }
+      - name: Install Salesforce CLI and Code Analyzer
+        run: |
+          npm install --global @salesforce/cli
+          sf plugins install code-analyzer
+
+      - name: S1 - Scan changed files
+        id: scan
+        continue-on-error: true # the gate step below re-fails the job if needed
+        run: |
+          targets=()
+          while read -r f; do
+            [ -f "$f" ] && [[ "$f" == "$SOURCE_DIR"/* ]] && targets+=(--target "$f")
+          done < ctx/changed_files.txt
+          echo '{}' > scan.json
+          [ ${#targets[@]} -eq 0 ] && exit 0
+          # Severity 1 = Critical, 2 = High in Code Analyzer v5. Verify against your plugin version.
+          sf code-analyzer run --workspace . "${targets[@]}" --output-file scan.json --severity-threshold 2
+
+      - id: gate
+        run: >
+          python3 .ai-gates/scripts/run_gate.py --gate security
+          --input scan_results=scan.json --input diff=ctx/pr.diff --out-dir gate-out
+      - if: always() && hashFiles('gate-out/security.comment.md') != ''
+        run: python3 .ai-gates/scripts/gh.py comment "$PR" gate-out/security.comment.md "${{ steps.gate.outputs.verdict }}"
+      - name: Fail on scanner high/critical findings
+        if: steps.scan.outcome == 'failure'
+        run: |
+          echo "Code Analyzer found High or Critical violations. See scan results above."
+          exit 1
